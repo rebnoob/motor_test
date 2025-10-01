@@ -123,7 +123,7 @@ def knee_rotor_to_joint(q_rotor):
 # ===================== Trajectory: Rectangle (anchor = bottom-right) =====================
 # Box size and speed (BOTTOM-RIGHT corner chosen at runtime)
 BOX_WY = 0.25   # width in y
-BOX_HZ = 0.15   # height in z
+BOX_HZ = 0.1   # height in z
 BOX_RC = 0.005  # small fillet helps at corners (set 0.0 if you want sharp corners)
 BOX_V  = 5.80   # path speed [m/s]
 
