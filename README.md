@@ -1,6 +1,6 @@
 # README.md
 
-If you have any questions or need assistance with usage, feel free to contact support@unitree.com.
+Guys to run the code you should run the main.py code under unitree_leg_gui. The code right now is really jank and we need to organize it.
 
 ### Notice
 
@@ -47,13 +47,3 @@ cmd.dq    = -6.28*queryGearRatio(MotorType::A1);
 cmd.tau   = 0.0;
 serial.sendRecv(&cmd,&data);
 ```
-
-![Simple Diagram of A1 Motor](Simple_Diagram_of_A1_Motor.png)
-
-Typically, for kp and kd, assuming the motor's gear ratio is r, when calculating kp and kd on the rotor side, we need to convert kp and kd on the output side by dividing them by the square of r. 
-
-$$kp_{\text{rotor}} = \frac{kp_{\text{output}}}{r^2}$$
-
-$$kd_{\text{rotor}} = \frac{kd_{\text{output}}}{r^2}$$
-
-This conversion relationship is demonstrated in the example `example_a1_motor_output.cpp`.By the way, in the example `example_a1_motor_output.cpp`, the kp on the rotor side is additionally divided by 26.07, and the kd on the rotor side is additionally multiplied by 100.0. These are magic numbers for the A1 and B1 motor. When controlling other motors, there is no need to consider these additional steps.
