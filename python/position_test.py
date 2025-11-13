@@ -25,8 +25,8 @@ GEAR = {0: 6.33, 1: 6.33, 2: 6.33 * (30.0 / 18.0)}  # ≈ {0:6.33, 1:6.33, 2:10.
 DIR  = {0: +1.0, 1: +1.0, 2: +1.0}  # set DIR[2] = -1.0 if your pulley flips the knee
 
 # PD gains (gentle)
-KP = 0.08
-KD = 0.08
+KP = 0.1
+KD = 0.1
 DT = 0.005  # 200 Hz control loop
 
 # Joint soft-limits (output-side radians)
@@ -38,7 +38,15 @@ VEL_LIMIT_OUTPUT = math.radians(720)  # output-side vel clamp (converted per joi
 def clamp(x, lo, hi): return max(lo, min(hi, x))
 
 # ================== Leg geometry (mm), +x fwd, +y left, +z DOWN ==================
-l1, l2, l3 = 80.0, 190.0, 360.0
+l1, l2, l3 = 90.0, 190.0, 120.0
+
+# For workspace clamping
+MAX_PLANAR = (l2 + l3) - 1.0  # small margin so we don't hit exact singular full-stretch
+MIN_PLANAR = 5.0              # don't let it go exactly to zero radius in the sagittal plane
+HIP_RING_EPS = 1.0            # how far outside the l1 circle we enforce
+
+# Singularity tolerance for knee straight/folded
+C3_SING_EPS = 1e-3
 
 def fk_leg(theta1, theta2, theta3, s_y=+1):
     """Forward kinematics (output-side radians) -> (x,y,z) mm, also returns planar z'."""
@@ -49,18 +57,37 @@ def fk_leg(theta1, theta2, theta3, s_y=+1):
     return np.array([x, y, z]), z_p
 
 def ik_leg(x, y, z, s_y=+1):
-    """Inverse kinematics (mm) -> list[(t1,t2,t3)] in output-side radians."""
+    """
+    Inverse kinematics (mm) -> list[(t1,t2,t3)] in output-side radians.
+    Now also rejects near-singular solutions (knee near straight/folded) and unreachable circle.
+    """
     sols = []
     r_yz = np.hypot(y, z)
-    if r_yz < l1 - 1e-9:
+    # must be outside the hip roll "donut"
+    if r_yz < (l1 + 1e-6):
         return sols
+
+    # distance from hip-roll pivot plane
     zprime_mag = np.sqrt(max(r_yz**2 - l1**2, 0.0))
+
+    # Planar radius in sagittal plane
+    r = np.hypot(x, zprime_mag)
+    # basic reach check
+    if r > (l2 + l3 + 1e-6) or r < 1e-6:
+        return sols
+
     for z_p in (zprime_mag, -zprime_mag):
         theta1 = np.arctan2(z, y) - np.arctan2(z_p, s_y*l1)
-        r = np.hypot(x, z_p)
-        c3 = (r*r - l2*l2 - l3*l3) / (2.0*l2*l3)
+        r_p = np.hypot(x, z_p)
+        # law of cosines for knee
+        c3 = (r_p*r_p - l2*l2 - l3*l3) / (2.0*l2*l3)
         if c3 < -1.0 or c3 > 1.0:
             continue
+
+        # reject singular (knee fully straight or fully folded)
+        if abs(1.0 - abs(c3)) < C3_SING_EPS:
+            continue
+
         for knee_sign in (1.0, -1.0):  # elbow-down/up
             theta3 = knee_sign * np.arccos(np.clip(c3, -1.0, 1.0))
             theta2 = np.arctan2(x, z_p) - np.arctan2(l3*np.sin(theta3), l2 + l3*np.cos(theta3))
@@ -94,6 +121,53 @@ def decode_merror(bits: int):
                 continue
             out.append(labels[b])
     return ",".join(out) if out else "OK"
+
+def clamp_to_workspace(x, y, z, s_y=+1):
+    """
+    Pull (x,y,z) back into a simple reachable bubble based on:
+      1) must be outside hip-roll radius l1
+      2) planar radius <= MAX_PLANAR
+    We do this in the geometric space of the same model the IK uses, so that
+    IK is very likely to succeed afterward.
+    """
+    # 1) ensure (y,z) is outside the roll circle
+    r_yz = math.hypot(y, z)
+    if r_yz < (l1 + HIP_RING_EPS):
+        # push it outward along (y,z)
+        if r_yz < 1e-6:
+            # arbitrary direction if user put (0,0)
+            y = s_y * (l1 + HIP_RING_EPS)
+            z = 0.0
+        else:
+            scale = (l1 + HIP_RING_EPS) / r_yz
+            y *= scale
+            z *= scale
+        r_yz = math.hypot(y, z)
+
+    # 2) get z' magnitude from (y,z)
+    zprime_mag = math.sqrt(max(r_yz**2 - l1**2, 0.0))
+    planar_r = math.hypot(x, zprime_mag)
+
+    # 3) limit planar radius
+    if planar_r > MAX_PLANAR:
+        # scale x and z' down
+        scale_p = MAX_PLANAR / planar_r
+        x *= scale_p
+        zprime_mag *= scale_p
+        # recompute (y,z) from new z'
+        # we want to keep the same azimuth in (y,z)
+        if r_yz > 1e-6:
+            # new r_yz from new z'
+            new_r_yz = math.sqrt(zprime_mag**2 + l1**2)
+            yz_scale = new_r_yz / r_yz
+            y *= yz_scale
+            z *= yz_scale
+
+    # 4) also avoid being exactly at 0 planar radius
+    if planar_r < MIN_PLANAR:
+        # push in x a little bit
+        x = MIN_PLANAR
+    return x, y, z
 
 # ================== GUI ==================
 class MotorGUI:
@@ -134,7 +208,7 @@ class MotorGUI:
         self.t2 = tk.DoubleVar(value=0.0)
         self.t3 = tk.DoubleVar(value=0.0)
 
-        # IK targets (mm)
+        # IK targets (mm) — initial guesses stay similar
         self.x = tk.DoubleVar(value=180.0)
         self.y = tk.DoubleVar(value=90.0)
         self.z = tk.DoubleVar(value=180.0)
@@ -232,13 +306,21 @@ class MotorGUI:
 
     def _build_ik_controls(self):
         f = self.ctrl_frame
+
+        # derive some reasonable GUI ranges from geometry
+        max_fwd = l2 + l3
+        min_fwd = -0.25 * (l2 + l3)   # a bit of back reach
+        max_lat = l1 + l2             # rough lateral
+        max_down = l2 + l3            # z down
+        max_up   = -30.0              # allow a bit up
+
         ttk.Label(f, text="IK Control (mm, hip frame; +x fwd, +y left, +z DOWN)").grid(row=0, column=0, columnspan=3, sticky="w")
         ttk.Label(f, text="x").grid(row=1, column=0, sticky="w")
-        ttk.Scale(f, from_=-50.0, to=520.0, variable=self.x, orient="horizontal", length=420).grid(row=1, column=1, columnspan=2, sticky="we")
+        ttk.Scale(f, from_=min_fwd, to=max_fwd, variable=self.x, orient="horizontal", length=420).grid(row=1, column=1, columnspan=2, sticky="we")
         ttk.Label(f, text="y").grid(row=2, column=0, sticky="w")
-        ttk.Scale(f, from_=-260.0, to=260.0, variable=self.y, orient="horizontal", length=420).grid(row=2, column=1, columnspan=2, sticky="we")
+        ttk.Scale(f, from_=-max_lat, to=max_lat, variable=self.y, orient="horizontal", length=420).grid(row=2, column=1, columnspan=2, sticky="we")
         ttk.Label(f, text="z").grid(row=3, column=0, sticky="w")
-        ttk.Scale(f, from_=-30.0, to=520.0, variable=self.z, orient="horizontal", length=420).grid(row=3, column=1, columnspan=2, sticky="we")
+        ttk.Scale(f, from_=max_up, to=max_down, variable=self.z, orient="horizontal", length=420).grid(row=3, column=1, columnspan=2, sticky="we")
 
     # ---------- Demo box
     def _build_demo_box(self, parent, row):
@@ -288,7 +370,7 @@ class MotorGUI:
         self._demo_status.set("Idle")
 
     def _demo_loop(self):
-        # Slider bounds (keep path inside)
+        # Slider bounds (keep path inside) — we will still clamp in control loop
         X_MIN, X_MAX = -50.0, 520.0
         Y_MIN, Y_MAX = -260.0, 260.0
         Z_MIN, Z_MAX = -30.0,  520.0
@@ -439,12 +521,20 @@ class MotorGUI:
                     self._command_joint_targets(t1, t2, t3)
                 else:
                     # IK: compute desired joint angles from (x,y,z)
-                    x, y, z = self.x.get(), self.y.get(), self.z.get()
-                    cands = ik_leg(x, y, z, s_y=self.s_y.get())
+                    x_req, y_req, z_req = self.x.get(), self.y.get(), self.z.get()
+
+                    # clamp to reachable workspace first
+                    x_c, y_c, z_c = clamp_to_workspace(x_req, y_req, z_req, s_y=self.s_y.get())
+                    if (abs(x_c - x_req) > 1e-6) or (abs(y_c - y_req) > 1e-6) or (abs(z_c - z_req) > 1e-6):
+                        # reflect clamped values back to GUI so user sees true reachable target
+                        self.x.set(x_c); self.y.set(y_c); self.z.set(z_c)
+
+                    cands = ik_leg(x_c, y_c, z_c, s_y=self.s_y.get())
                     prev = self.prev_solution[0] if len(self.prev_solution) else None
                     sol = pick_closest_solution(prev, cands)
+
                     if sol is None:
-                        # no solution; hold current softly
+                        # no solution (either true out-of-reach or singular) -> hold current softly
                         for i in MOTOR_IDS:
                             c = self.cmds[i]
                             c.mode = CONTROL_MODE
@@ -453,6 +543,7 @@ class MotorGUI:
                             c.dq = 0.0; c.tau = 0.0
                             self.serial.sendRecv(c, self.datas[i])
                         continue
+
                     self.prev_solution.clear(); self.prev_solution.append(sol)
                     t1, t2, t3 = sol
                     self._command_joint_targets(t1, t2, t3)
